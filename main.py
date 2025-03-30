@@ -352,7 +352,7 @@ async def comando_start(client, mensagem: Message):
         "• Ou use /up <URL>\n"
         "• Para legenda direta: /leg <URL> <texto>\n"
         "• Para adicionar legenda depois: responda com /leg <texto>\n\n"
-        "💡 **Suporte a:** YouTube, XVideos e outros sites\n"
+        "💡 **Suporte a:** YouTube, XVideos e centenas de outros sites\n"
         "💡 **Em canais:** Responda a postagens com os comandos para enviar como comentário"
     )
 
@@ -421,10 +421,17 @@ async def comando_upload(client, mensagem: Message):
 
         await msg_status.edit("⬇️ Baixando arquivo...")
 
-        # Verificar se é um site suportado pelo yt-dlp
-        if any(domain in url for domain in ['youtube.com', 'youtu.be', 'xvideos.com']):
+        # Tentar primeiro com yt-dlp para qualquer URL - MODIFICAÇÃO PRINCIPAL
+        try:
+            # Testar se o yt-dlp reconhece a URL como site compatível
+            with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+                info_dict = await asyncio.to_thread(ydl.extract_info, url, download=False, process=False)
+            
+            # Se chegou aqui, é compatível com yt-dlp
             sucesso = await baixar_com_ytdlp(url, caminho_arquivo, msg_status)
-        else:
+        except Exception as e:
+            logger.info(f"URL não compatível com yt-dlp: {str(e)}")
+            # Se falhar, usar o método genérico para URLs diretas
             sucesso = await download_arquivo_generico(url, caminho_arquivo, msg_status)
 
         if not sucesso or not os.path.exists(caminho_arquivo):
@@ -524,10 +531,17 @@ async def lidar_com_links_automaticos(client, mensagem: Message):
 
         await msg_status.edit("⬇️ Baixando vídeo...")
 
-        # Priorizar yt-dlp para vídeos de sites suportados
-        if any(domain in url for domain in ['youtube.com', 'youtu.be', 'xvideos.com']):
+        # Tentar primeiro com yt-dlp para qualquer URL - MODIFICAÇÃO PRINCIPAL
+        try:
+            # Testar se o yt-dlp reconhece a URL como site compatível
+            with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+                info_dict = await asyncio.to_thread(ydl.extract_info, url, download=False, process=False)
+            
+            # Se chegou aqui, é compatível com yt-dlp
             sucesso = await baixar_com_ytdlp(url, caminho_arquivo, msg_status)
-        else:
+        except Exception as e:
+            logger.info(f"URL não compatível com yt-dlp: {str(e)}")
+            # Se falhar, usar o método genérico para URLs diretas
             sucesso = await download_arquivo_generico(url, caminho_arquivo, msg_status)
 
         if not sucesso or not os.path.exists(caminho_arquivo):
