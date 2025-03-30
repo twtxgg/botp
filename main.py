@@ -47,7 +47,6 @@ TEMPO_INICIO = 0
 DOWNLOAD_CANCELADO = False
 UPLOAD_CANCELADO = False
 TAMANHO_TOTAL_ARQUIVO = 0
-LOOP = None  # Para armazenar o event loop principal
 
 # Dicionário para armazenar o status de cada download/upload
 STATUS_PROCESSOS = {}
@@ -148,31 +147,9 @@ def tratar_flood_wait(func):
             return await func(*args, **kwargs)
     return wrapper
 
-# Função modificada para executar no loop principal
-def progresso_download(d, mensagem_status):
-    """Callback de progresso do yt-dlp que executa corretamente no event loop"""
-    global DOWNLOAD_CANCELADO, TAMANHO_TOTAL_ARQUIVO, LOOP
-
-    if DOWNLOAD_CANCELADO:
-        raise Exception("Download cancelado pelo usuário")
-
-    if d['status'] == 'downloading':
-        baixado = d.get('downloaded_bytes', 0)
-        total = d.get('total_bytes') or d.get('total_bytes_estimate') or TAMANHO_TOTAL_ARQUIVO
-        
-        if total > 0 and LOOP:
-            # Criar uma future para executar no loop principal
-            asyncio.run_coroutine_threadsafe(
-                atualizar_progresso_download(baixado, total, mensagem_status),
-                LOOP
-            )
-
 async def baixar_com_ytdlp(url, caminho_arquivo, mensagem_status):
     """Download usando yt-dlp com configurações especiais para XVideos e YouTube"""
-    global DOWNLOAD_CANCELADO, TAMANHO_TOTAL_ARQUIVO, LOOP
-
-    # Armazenar o loop principal para uso na função de progresso
-    LOOP = asyncio.get_running_loop()
+    global DOWNLOAD_CANCELADO, TAMANHO_TOTAL_ARQUIVO
 
     opcoes_ydl = {
         'outtmpl': caminho_arquivo,
@@ -288,6 +265,18 @@ async def download_arquivo_generico(url, caminho_arquivo, mensagem_status):
     except Exception as e:
         logger.error(f"Erro ao baixar arquivo: {e}")
         return False
+
+async def progresso_download(d, mensagem_status):
+    """Atualiza o progresso do download"""
+    global DOWNLOAD_CANCELADO, TAMANHO_TOTAL_ARQUIVO
+
+    if DOWNLOAD_CANCELADO:
+        raise Exception("Download cancelado pelo usuário")
+
+    if d['status'] == 'downloading':
+        baixado = d['downloaded_bytes']
+        TAMANHO_TOTAL_ARQUIVO = d['total_bytes'] or d['total_bytes_estimate']
+        await atualizar_progresso_download(baixado, TAMANHO_TOTAL_ARQUIVO, mensagem_status)
 
 @tratar_flood_wait
 async def atualizar_progresso_download(baixado, total, mensagem):
