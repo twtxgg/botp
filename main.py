@@ -228,14 +228,8 @@ async def baixar_com_ytdlp(url, caminho_arquivo, mensagem_status):
 
     try:
         with yt_dlp.YoutubeDL(opcoes_ydl) as ydl:
-            info = await asyncio.to_thread(ydl.extract_info, url, download=False)
-            TAMANHO_TOTAL_ARQUIVO = info.get('filesize') or info.get('total_bytes')
-            if TAMANHO_TOTAL_ARQUIVO is None:
-                TAMANHO_TOTAL_ARQUIVO = 0
-                logger.warning("Não foi possível determinar o tamanho total do arquivo antes do download.")
-
-            await asyncio.to_thread(ydl.download, [url])
-
+            info = await asyncio.to_thread(ydl.extract_info, url, download=True)
+            
         # Verifica se o arquivo foi baixado corretamente
         if not os.path.exists(caminho_arquivo):
             # Tenta encontrar o arquivo pelo nome padrão do yt-dlp
@@ -244,13 +238,13 @@ async def baixar_com_ytdlp(url, caminho_arquivo, mensagem_status):
                 os.rename(filename, caminho_arquivo)
             else:
                 return False
-
+                
         return True
     except Exception as e:
         logger.error(f"Erro ao baixar com yt-dlp: {str(e)}")
         # Tentar fallback mais simples
         try:
-            with yt_dlp.YoutubeDL({'format': 'best', 'outtmpl': caminho_arquivo, 'progress_hooks': [lambda d: progresso_download(d, mensagem_status)]}) as ydl:
+            with yt_dlp.YoutubeDL({'format': 'best', 'outtmpl': caminho_arquivo}) as ydl:
                 await asyncio.to_thread(ydl.download, [url])
             return os.path.exists(caminho_arquivo)
         except Exception as e2:
