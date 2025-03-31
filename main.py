@@ -3,7 +3,7 @@ import asyncio
 import yt_dlp
 import aiohttp
 from pyrogram import Client, filters, enums
-from pyrogram.types import Message
+from pyrogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup
 from pyrogram.errors import MessageNotModified, FloodWait
 import logging
 import time
@@ -44,6 +44,13 @@ app = Client(
 # Variáveis globais
 ULTIMO_TEMPO_ATUALIZACAO = 0
 TEMPO_INICIO = 0
+DOWNLOAD_CANCELADO = False
+UPLOAD_CANCELADO = False
+TAMANHO_TOTAL_ARQUIVO = 0
+LOOP = None  # Para armazenar o event loop principal
+
+# Dicionário para armazenar o status de cada download/upload
+STATUS_PROCESSOS = {}
 
 def eh_comentario_canal(mensagem: Message) -> bool:
     """Verifica se a mensagem é um comentário em um canal"""
@@ -84,7 +91,7 @@ def extrair_metadados_video(caminho_arquivo):
     try:
         if not os.path.exists(caminho_arquivo):
             raise Exception("Arquivo não encontrado")
-        
+
         if os.path.getsize(caminho_arquivo) == 0:
             raise Exception("Arquivo vazio")
 
@@ -141,8 +148,32 @@ def tratar_flood_wait(func):
             return await func(*args, **kwargs)
     return wrapper
 
-async def baixar_com_ytdlp(url, caminho_arquivo):
+# Função modificada para executar no loop principal
+def progresso_download(d, mensagem_status):
+    """Callback de progresso do yt-dlp que executa corretamente no event loop"""
+    global DOWNLOAD_CANCELADO, TAMANHO_TOTAL_ARQUIVO, LOOP
+
+    if DOWNLOAD_CANCELADO:
+        raise Exception("Download cancelado pelo usuário")
+
+    if d['status'] == 'downloading':
+        baixado = d.get('downloaded_bytes', 0)
+        total = d.get('total_bytes') or d.get('total_bytes_estimate') or TAMANHO_TOTAL_ARQUIVO
+        
+        if total > 0 and LOOP:
+            # Criar uma future para executar no loop principal
+            asyncio.run_coroutine_threadsafe(
+                atualizar_progresso_download(baixado, total, mensagem_status),
+                LOOP
+            )
+
+async def baixar_com_ytdlp(url, caminho_arquivo, mensagem_status):
     """Download usando yt-dlp com configurações especiais para XVideos e YouTube"""
+    global DOWNLOAD_CANCELADO, TAMANHO_TOTAL_ARQUIVO, LOOP
+
+    # Armazenar o loop principal para uso na função de progresso
+    LOOP = asyncio.get_running_loop()
+
     opcoes_ydl = {
         'outtmpl': caminho_arquivo,
         'quiet': True,
@@ -154,6 +185,7 @@ async def baixar_com_ytdlp(url, caminho_arquivo):
         'fragment_retries': 3,
         'continue_dl': True,
         'socket_timeout': 30,
+        'progress_hooks': [lambda d: progresso_download(d, mensagem_status)],
     }
 
     # Configurações específicas para XVideos
@@ -196,8 +228,14 @@ async def baixar_com_ytdlp(url, caminho_arquivo):
 
     try:
         with yt_dlp.YoutubeDL(opcoes_ydl) as ydl:
-            info = await asyncio.to_thread(ydl.extract_info, url, download=True)
-            
+            info = await asyncio.to_thread(ydl.extract_info, url, download=False)
+            TAMANHO_TOTAL_ARQUIVO = info.get('filesize') or info.get('total_bytes')
+            if TAMANHO_TOTAL_ARQUIVO is None:
+                TAMANHO_TOTAL_ARQUIVO = 0
+                logger.warning("Não foi possível determinar o tamanho total do arquivo antes do download.")
+
+            await asyncio.to_thread(ydl.download, [url])
+
         # Verifica se o arquivo foi baixado corretamente
         if not os.path.exists(caminho_arquivo):
             # Tenta encontrar o arquivo pelo nome padrão do yt-dlp
@@ -206,21 +244,23 @@ async def baixar_com_ytdlp(url, caminho_arquivo):
                 os.rename(filename, caminho_arquivo)
             else:
                 return False
-                
+
         return True
     except Exception as e:
         logger.error(f"Erro ao baixar com yt-dlp: {str(e)}")
         # Tentar fallback mais simples
         try:
-            with yt_dlp.YoutubeDL({'format': 'best', 'outtmpl': caminho_arquivo}) as ydl:
+            with yt_dlp.YoutubeDL({'format': 'best', 'outtmpl': caminho_arquivo, 'progress_hooks': [lambda d: progresso_download(d, mensagem_status)]}) as ydl:
                 await asyncio.to_thread(ydl.download, [url])
             return os.path.exists(caminho_arquivo)
         except Exception as e2:
             logger.error(f"Fallback também falhou: {str(e2)}")
             return False
 
-async def download_arquivo_generico(url, caminho_arquivo):
+async def download_arquivo_generico(url, caminho_arquivo, mensagem_status):
     """Download de qualquer tipo de arquivo genérico"""
+    global DOWNLOAD_CANCELADO, TAMANHO_TOTAL_ARQUIVO
+    baixado = 0
     try:
         headers = {'User-Agent': Config.USER_AGENT}
         if 'xvideos.com' in url:
@@ -232,9 +272,15 @@ async def download_arquivo_generico(url, caminho_arquivo):
         async with aiohttp.ClientSession(headers=headers) as session:
             async with session.get(url) as response:
                 if response.status == 200:
+                    TAMANHO_TOTAL_ARQUIVO = int(response.headers.get('Content-Length', 0))
                     with open(caminho_arquivo, 'wb') as f:
                         async for chunk in response.content.iter_chunked(1024*1024):  # 1MB chunks
+                            if DOWNLOAD_CANCELADO:
+                                logger.info("Download cancelado pelo usuário.")
+                                return False
                             f.write(chunk)
+                            baixado += len(chunk)
+                            await atualizar_progresso_download(baixado, TAMANHO_TOTAL_ARQUIVO, mensagem_status)
                     return True
                 else:
                     logger.error(f"Erro HTTP {response.status} ao baixar arquivo")
@@ -244,9 +290,42 @@ async def download_arquivo_generico(url, caminho_arquivo):
         return False
 
 @tratar_flood_wait
+async def atualizar_progresso_download(baixado, total, mensagem):
+    """Atualiza a mensagem de progresso do download"""
+    global ULTIMO_TEMPO_ATUALIZACAO, TEMPO_INICIO
+
+    agora = time.time()
+    if agora - ULTIMO_TEMPO_ATUALIZACAO < Config.INTERVALO_ATUALIZACAO:
+        return
+
+    ULTIMO_TEMPO_ATUALIZACAO = agora
+    percentual = (baixado / total) * 100 if total > 0 else 0
+    tempo_decorrido = agora - TEMPO_INICIO
+    velocidade = baixado / tempo_decorrido if tempo_decorrido > 0 else 0
+    tempo_restante = (total - baixado) / velocidade if velocidade > 0 else 0
+
+    try:
+        texto = (
+            f"⬇️ **Progresso do Download**\n"
+            f"📦 Tamanho Total: {converter_bytes(total)}\n"
+            f"{criar_barra_progresso(percentual)} {percentual:.1f}%\n"
+            f"⚡ {converter_bytes(velocidade)}/s\n"
+            f"⏱️ {tempo_restante:.0f}s restantes"
+        )
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Cancelar", callback_data="cancelar_download")]])
+        await mensagem.edit(texto, reply_markup=keyboard)
+    except MessageNotModified:
+        pass
+    except Exception as e:
+        logger.warning(f"Falha ao atualizar progresso do download: {e}")
+
+@tratar_flood_wait
 async def callback_progresso(atual, total, mensagem):
     """Callback de progresso com controle de flood"""
-    global ULTIMO_TEMPO_ATUALIZACAO
+    global ULTIMO_TEMPO_ATUALIZACAO, UPLOAD_CANCELADO
+
+    if UPLOAD_CANCELADO:
+        raise Exception("Upload cancelado pelo usuário")
 
     agora = time.time()
     if agora - ULTIMO_TEMPO_ATUALIZACAO < Config.INTERVALO_ATUALIZACAO:
@@ -261,11 +340,13 @@ async def callback_progresso(atual, total, mensagem):
     try:
         texto = (
             f"📤 **Progresso do Upload**\n"
+            f"📦 Tamanho Total: {converter_bytes(total)}\n"
             f"{criar_barra_progresso(percentual)} {percentual:.1f}%\n"
             f"⚡ {converter_bytes(velocidade)}/s\n"
             f"⏱️ {tempo_restante:.0f}s restantes"
         )
-        await mensagem.edit(texto)
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Cancelar", callback_data="cancelar_upload")]])
+        await mensagem.edit(texto, reply_markup=keyboard)
     except MessageNotModified:
         pass
     except Exception as e:
@@ -282,7 +363,7 @@ async def comando_start(client, mensagem: Message):
         "• Ou use /up <URL>\n"
         "• Para legenda direta: /leg <URL> <texto>\n"
         "• Para adicionar legenda depois: responda com /leg <texto>\n\n"
-        "💡 **Suporte a:** YouTube, XVideos e outros sites\n"
+        "💡 **Suporte a:** YouTube, XVideos e centenas de outros sites\n"
         "💡 **Em canais:** Responda a postagens com os comandos para enviar como comentário"
     )
 
@@ -290,8 +371,11 @@ async def comando_start(client, mensagem: Message):
 @tratar_flood_wait
 async def comando_upload(client, mensagem: Message):
     """Manipula os comandos /up e /leg"""
-    global TEMPO_INICIO
+    global TEMPO_INICIO, DOWNLOAD_CANCELADO, UPLOAD_CANCELADO, TAMANHO_TOTAL_ARQUIVO
     TEMPO_INICIO = time.time()
+    DOWNLOAD_CANCELADO = False
+    UPLOAD_CANCELADO = False
+    TAMANHO_TOTAL_ARQUIVO = 0
 
     eh_resposta = mensagem.reply_to_message is not None
     mensagem_original = mensagem.reply_to_message if eh_resposta else None
@@ -299,7 +383,7 @@ async def comando_upload(client, mensagem: Message):
     if mensagem.command[0] == "leg" and len(mensagem.command) > 1:
         padrao_url = re.compile(r'(https?://\S+)')
         match = padrao_url.search(mensagem.text)
-        
+
         if match:
             url = match.group(1)
             # Pega todo o texto após o comando, remove a URL e limpa os espaços
@@ -348,11 +432,18 @@ async def comando_upload(client, mensagem: Message):
 
         await msg_status.edit("⬇️ Baixando arquivo...")
 
-        # Verificar se é um site suportado pelo yt-dlp
-        if any(domain in url for domain in ['youtube.com', 'youtu.be', 'xvideos.com']):
-            sucesso = await baixar_com_ytdlp(url, caminho_arquivo)
-        else:
-            sucesso = await download_arquivo_generico(url, caminho_arquivo)
+        # Tentar primeiro com yt-dlp para qualquer URL - MODIFICAÇÃO PRINCIPAL
+        try:
+            # Testar se o yt-dlp reconhece a URL como site compatível
+            with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+                info_dict = await asyncio.to_thread(ydl.extract_info, url, download=False, process=False)
+            
+            # Se chegou aqui, é compatível com yt-dlp
+            sucesso = await baixar_com_ytdlp(url, caminho_arquivo, msg_status)
+        except Exception as e:
+            logger.info(f"URL não compatível com yt-dlp: {str(e)}")
+            # Se falhar, usar o método genérico para URLs diretas
+            sucesso = await download_arquivo_generico(url, caminho_arquivo, msg_status)
 
         if not sucesso or not os.path.exists(caminho_arquivo):
             await msg_status.edit("❌ Falha no download do arquivo")
@@ -429,8 +520,11 @@ async def comando_upload(client, mensagem: Message):
 @tratar_flood_wait
 async def lidar_com_links_automaticos(client, mensagem: Message):
     """Handler para links automáticos (sem comando)"""
-    global TEMPO_INICIO
+    global TEMPO_INICIO, DOWNLOAD_CANCELADO, UPLOAD_CANCELADO, TAMANHO_TOTAL_ARQUIVO
     TEMPO_INICIO = time.time()
+    DOWNLOAD_CANCELADO = False
+    UPLOAD_CANCELADO = False
+    TAMANHO_TOTAL_ARQUIVO = 0
 
     eh_resposta = mensagem.reply_to_message is not None
     mensagem_original = mensagem.reply_to_message if eh_resposta else None
@@ -448,11 +542,18 @@ async def lidar_com_links_automaticos(client, mensagem: Message):
 
         await msg_status.edit("⬇️ Baixando vídeo...")
 
-        # Priorizar yt-dlp para vídeos de sites suportados
-        if any(domain in url for domain in ['youtube.com', 'youtu.be', 'xvideos.com']):
-            sucesso = await baixar_com_ytdlp(url, caminho_arquivo)
-        else:
-            sucesso = await download_arquivo_generico(url, caminho_arquivo)
+        # Tentar primeiro com yt-dlp para qualquer URL - MODIFICAÇÃO PRINCIPAL
+        try:
+            # Testar se o yt-dlp reconhece a URL como site compatível
+            with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+                info_dict = await asyncio.to_thread(ydl.extract_info, url, download=False, process=False)
+            
+            # Se chegou aqui, é compatível com yt-dlp
+            sucesso = await baixar_com_ytdlp(url, caminho_arquivo, msg_status)
+        except Exception as e:
+            logger.info(f"URL não compatível com yt-dlp: {str(e)}")
+            # Se falhar, usar o método genérico para URLs diretas
+            sucesso = await download_arquivo_generico(url, caminho_arquivo, msg_status)
 
         if not sucesso or not os.path.exists(caminho_arquivo):
             await msg_status.edit("❌ Falha no download do vídeo")
@@ -507,6 +608,28 @@ async def lidar_com_links_automaticos(client, mensagem: Message):
         except:
             pass
 
+@app.on_callback_query(filters.regex("cancelar_download"))
+async def cancelar_download_callback(client, callback_query):
+    """Cancela o download quando o botão é clicado"""
+    global DOWNLOAD_CANCELADO
+    DOWNLOAD_CANCELADO = True
+    await callback_query.answer("Download cancelado.")
+    try:
+        await callback_query.edit_message_text("❌ Download cancelado pelo usuário.")
+    except:
+        pass
+
+@app.on_callback_query(filters.regex("cancelar_upload"))
+async def cancelar_upload_callback(client, callback_query):
+    """Cancela o upload quando o botão é clicado"""
+    global UPLOAD_CANCELADO
+    UPLOAD_CANCELADO = True
+    await callback_query.answer("Upload cancelado.")
+    try:
+        await callback_query.edit_message_text("❌ Upload cancelado pelo usuário.")
+    except:
+        pass
+
 if __name__ == "__main__":
     # Garante que as pastas existam
     os.makedirs(Config.PASTA_DOWNLOAD, exist_ok=True)
@@ -519,7 +642,7 @@ if __name__ == "__main__":
                 os.remove(os.path.join(Config.PASTA_DOWNLOAD, file))
             except:
                 pass
-    
+
     for file in os.listdir(Config.PASTA_THUMB):
         if file.startswith('thumb_'):
             try:
