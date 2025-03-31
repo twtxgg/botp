@@ -33,6 +33,7 @@ class Config:
     TAMANHO_MAXIMO = 2000 * 1024 * 1024  # 2GB
     INTERVALO_ATUALIZACAO = 5  # Segundos entre atualizações de progresso
     USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    YT_COOKIES = "./cookies.txt"  # Adicione este caminho para cookies se necessário
 
 app = Client(
     "bot_upload_video",
@@ -47,10 +48,7 @@ TEMPO_INICIO = 0
 DOWNLOAD_CANCELADO = False
 UPLOAD_CANCELADO = False
 TAMANHO_TOTAL_ARQUIVO = 0
-LOOP = None  # Para armazenar o event loop principal
-
-# Dicionário para armazenar o status de cada download/upload
-STATUS_PROCESSOS = {}
+LOOP = None
 
 def eh_comentario_canal(mensagem: Message) -> bool:
     """Verifica se a mensagem é um comentário em um canal"""
@@ -58,11 +56,7 @@ def eh_comentario_canal(mensagem: Message) -> bool:
             mensagem.reply_to_message is not None)
 
 async def apagar_url_se_permitido(client: Client, mensagem: Message, eh_resposta: bool):
-    """
-    Tenta apagar a URL conforme as permissões
-    - Funciona em grupos, canais e comentários de canais
-    - Não apaga em chats privados
-    """
+    """Tenta apagar a URL conforme as permissões"""
     try:
         if eh_resposta or mensagem.chat.type in [enums.ChatType.SUPERGROUP, enums.ChatType.CHANNEL, enums.ChatType.GROUP]:
             await asyncio.sleep(2)
@@ -95,7 +89,6 @@ def extrair_metadados_video(caminho_arquivo):
         if os.path.getsize(caminho_arquivo) == 0:
             raise Exception("Arquivo vazio")
 
-        # Comandos para extrair duração e dimensões
         comando_duracao = [
             'ffprobe', '-v', 'error',
             '-show_entries', 'format=duration',
@@ -113,7 +106,6 @@ def extrair_metadados_video(caminho_arquivo):
         duracao = float(subprocess.check_output(comando_duracao).decode('utf-8').strip())
         dimensoes = subprocess.check_output(comando_dimensoes).decode('utf-8').strip().split(',')
 
-        # Gerar thumbnail
         caminho_thumbnail = os.path.join(Config.PASTA_THUMB, f"thumb_{os.path.basename(caminho_arquivo)}.jpg")
         if os.path.exists(caminho_thumbnail):
             os.remove(caminho_thumbnail)
@@ -148,9 +140,8 @@ def tratar_flood_wait(func):
             return await func(*args, **kwargs)
     return wrapper
 
-# Função modificada para executar no loop principal
 def progresso_download(d, mensagem_status):
-    """Callback de progresso do yt-dlp que executa corretamente no event loop"""
+    """Callback de progresso do yt-dlp"""
     global DOWNLOAD_CANCELADO, TAMANHO_TOTAL_ARQUIVO, LOOP
 
     if DOWNLOAD_CANCELADO:
@@ -161,17 +152,15 @@ def progresso_download(d, mensagem_status):
         total = d.get('total_bytes') or d.get('total_bytes_estimate') or TAMANHO_TOTAL_ARQUIVO
         
         if total > 0 and LOOP:
-            # Criar uma future para executar no loop principal
             asyncio.run_coroutine_threadsafe(
                 atualizar_progresso_download(baixado, total, mensagem_status),
                 LOOP
             )
 
 async def baixar_com_ytdlp(url, caminho_arquivo, mensagem_status):
-    """Download usando yt-dlp com configurações especiais para XVideos e YouTube"""
+    """Download usando yt-dlp com configurações especiais"""
     global DOWNLOAD_CANCELADO, TAMANHO_TOTAL_ARQUIVO, LOOP
 
-    # Armazenar o loop principal para uso na função de progresso
     LOOP = asyncio.get_running_loop()
 
     opcoes_ydl = {
@@ -186,10 +175,41 @@ async def baixar_com_ytdlp(url, caminho_arquivo, mensagem_status):
         'continue_dl': True,
         'socket_timeout': 30,
         'progress_hooks': [lambda d: progresso_download(d, mensagem_status)],
+        'extract_flat': False,
+        'ignore_no_formats_error': True,
+        'compat_opts': ['youtube-dl'],
+        'throttled_rate': '100K',
+        'sleep_interval_requests': 1,
     }
 
-    # Configurações específicas para XVideos
-    if 'xvideos.com' in url:
+    # Configurações específicas para YouTube
+    if 'youtube.com' in url or 'youtu.be' in url:
+        yt_opcoes = {
+            'format': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]',
+            'merge_output_format': 'mp4',
+            'postprocessors': [{
+                'key': 'FFmpegVideoConvertor',
+                'preferedformat': 'mp4'
+            }],
+            'extractor_args': {
+                'youtube': {
+                    'skip': ['dash', 'hls'],
+                    'player_client': ['android', 'web']
+                }
+            },
+            'throttled_rate': '500K',
+            'sleep_interval': 5,
+            'max_sleep_interval': 30,
+        }
+        
+        # Se existir arquivo de cookies, adiciona às opções
+        if os.path.exists(Config.YT_COOKIES):
+            yt_opcoes['cookiefile'] = Config.YT_COOKIES
+        
+        opcoes_ydl.update(yt_opcoes)
+    
+    # Configurações para XVideos
+    elif 'xvideos.com' in url:
         opcoes_ydl.update({
             'format': 'best',
             'headers': {
@@ -204,39 +224,13 @@ async def baixar_com_ytdlp(url, caminho_arquivo, mensagem_status):
                 }
             }
         })
-    # Configurações para YouTube (modificado para funcionar como na versão antiga)
-    elif 'youtube.com' in url or 'youtu.be' in url:
-        opcoes_ydl.update({
-            'format': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]',
-            'merge_output_format': 'mp4',
-            'postprocessors': [{
-                'key': 'FFmpegVideoConvertor',
-                'preferedformat': 'mp4'
-            }],
-            'youtube_include_dash_manifest': False,
-            'youtube_include_hls_manifest': False,
-        })
-    # Configuração padrão para outros sites
-    else:
-        opcoes_ydl.update({
-            'format': 'best[ext=mp4]/best',
-            'postprocessors': [{
-                'key': 'FFmpegVideoConvertor',
-                'preferedformat': 'mp4'
-            }]
-        })
 
     try:
         with yt_dlp.YoutubeDL(opcoes_ydl) as ydl:
-            # Método direto que funcionava na versão antiga
             info = await asyncio.to_thread(ydl.extract_info, url, download=True)
-            
-            # Atualiza o tamanho total para o progresso
             TAMANHO_TOTAL_ARQUIVO = info.get('filesize') or info.get('filesize_approx') or 0
 
-        # Verifica se o arquivo foi baixado corretamente
         if not os.path.exists(caminho_arquivo):
-            # Tenta encontrar o arquivo pelo nome padrão do yt-dlp
             filename = ydl.prepare_filename(info)
             if os.path.exists(filename):
                 os.rename(filename, caminho_arquivo)
@@ -246,18 +240,32 @@ async def baixar_com_ytdlp(url, caminho_arquivo, mensagem_status):
         return True
     except Exception as e:
         logger.error(f"Erro ao baixar com yt-dlp: {str(e)}")
-        # Tentar fallback mais simples
-        try:
-            with yt_dlp.YoutubeDL({
-                'format': 'best',
-                'outtmpl': caminho_arquivo,
-                'progress_hooks': [lambda d: progresso_download(d, mensagem_status)]
-            }) as ydl:
-                await asyncio.to_thread(ydl.download, [url])
-            return os.path.exists(caminho_arquivo)
-        except Exception as e2:
-            logger.error(f"Fallback também falhou: {str(e2)}")
-            return False
+        
+        # Tentar método alternativo para YouTube
+        if ('youtube.com' in url or 'youtu.be' in url) and not os.path.exists(Config.YT_COOKIES):
+            logger.info("Tentando método alternativo para YouTube...")
+            opcoes_alternativas = opcoes_ydl.copy()
+            opcoes_alternativas.update({
+                'extractor_args': {
+                    'youtube': {
+                        'skip': ['dash', 'hls'],
+                        'player_client': ['android']
+                    }
+                },
+                'throttled_rate': '300K',
+            })
+            
+            try:
+                with yt_dlp.YoutubeDL(opcoes_alternativas) as ydl_alt:
+                    info = await asyncio.to_thread(ydl_alt.extract_info, url, download=True)
+                    TAMANHO_TOTAL_ARQUIVO = info.get('filesize') or info.get('filesize_approx') or 0
+                
+                if os.path.exists(caminho_arquivo):
+                    return True
+            except Exception as e2:
+                logger.error(f"Método alternativo também falhou: {str(e2)}")
+        
+        return False
 
 async def download_arquivo_generico(url, caminho_arquivo, mensagem_status):
     """Download de qualquer tipo de arquivo genérico"""
@@ -276,7 +284,7 @@ async def download_arquivo_generico(url, caminho_arquivo, mensagem_status):
                 if response.status == 200:
                     TAMANHO_TOTAL_ARQUIVO = int(response.headers.get('Content-Length', 0))
                     with open(caminho_arquivo, 'wb') as f:
-                        async for chunk in response.content.iter_chunked(1024*1024):  # 1MB chunks
+                        async for chunk in response.content.iter_chunked(1024*1024):
                             if DOWNLOAD_CANCELADO:
                                 logger.info("Download cancelado pelo usuário.")
                                 return False
@@ -388,7 +396,6 @@ async def comando_upload(client, mensagem: Message):
 
         if match:
             url = match.group(1)
-            # Pega todo o texto após o comando, remove a URL e limpa os espaços
             legenda = mensagem.text.replace(match.group(0), "").replace("/leg ", "").strip()
         elif eh_resposta:
             if len(mensagem.command) < 2:
@@ -419,32 +426,26 @@ async def comando_upload(client, mensagem: Message):
         return
 
     msg_status = await mensagem.reply("🔍 Iniciando processamento...")
-
-    # Determinar extensão baseada na URL ou tipo de conteúdo
-    extensao = '.mp4'  # Padrão para vídeos
+    extensao = '.mp4'
     if any(ext in url.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif']):
         extensao = os.path.splitext(url.split('?')[0])[1].lower()
 
     caminho_arquivo = os.path.join(Config.PASTA_DOWNLOAD, f"dl_{mensagem.id}{extensao}")
 
     try:
-        # Limpar arquivos antigos com o mesmo nome
         if os.path.exists(caminho_arquivo):
             os.remove(caminho_arquivo)
 
         await msg_status.edit("⬇️ Baixando arquivo...")
 
-        # Tentar primeiro com yt-dlp para qualquer URL - MODIFICAÇÃO PRINCIPAL
+        # Tentar primeiro com yt-dlp para qualquer URL
         try:
-            # Testar se o yt-dlp reconhece a URL como site compatível
             with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
                 info_dict = await asyncio.to_thread(ydl.extract_info, url, download=False, process=False)
             
-            # Se chegou aqui, é compatível com yt-dlp
             sucesso = await baixar_com_ytdlp(url, caminho_arquivo, msg_status)
         except Exception as e:
             logger.info(f"URL não compatível com yt-dlp: {str(e)}")
-            # Se falhar, usar o método genérico para URLs diretas
             sucesso = await download_arquivo_generico(url, caminho_arquivo, msg_status)
 
         if not sucesso or not os.path.exists(caminho_arquivo):
@@ -459,7 +460,6 @@ async def comando_upload(client, mensagem: Message):
 
         await msg_status.edit("📊 Processando vídeo...")
 
-        # Preparar parâmetros de envio
         params = {
             'caption': legenda,
             'progress': callback_progresso,
@@ -471,7 +471,6 @@ async def comando_upload(client, mensagem: Message):
 
         await msg_status.edit("⬆️ Enviando arquivo...")
 
-        # Verificar tipo de arquivo e enviar
         if extensao in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']:
             await client.send_photo(
                 chat_id=mensagem.chat.id,
@@ -511,7 +510,6 @@ async def comando_upload(client, mensagem: Message):
         logger.error(f"Erro no processamento: {str(e)}")
         await msg_status.edit(f"⚠️ Erro: {str(e)[:200]}")
     finally:
-        # Limpeza de arquivos temporários
         if os.path.exists(caminho_arquivo):
             os.remove(caminho_arquivo)
         thumb_path = os.path.join(Config.PASTA_THUMB, f"thumb_{os.path.basename(caminho_arquivo)}.jpg")
@@ -544,17 +542,13 @@ async def lidar_com_links_automaticos(client, mensagem: Message):
 
         await msg_status.edit("⬇️ Baixando vídeo...")
 
-        # Tentar primeiro com yt-dlp para qualquer URL - MODIFICAÇÃO PRINCIPAL
         try:
-            # Testar se o yt-dlp reconhece a URL como site compatível
             with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
                 info_dict = await asyncio.to_thread(ydl.extract_info, url, download=False, process=False)
             
-            # Se chegou aqui, é compatível com yt-dlp
             sucesso = await baixar_com_ytdlp(url, caminho_arquivo, msg_status)
         except Exception as e:
             logger.info(f"URL não compatível com yt-dlp: {str(e)}")
-            # Se falhar, usar o método genérico para URLs diretas
             sucesso = await download_arquivo_generico(url, caminho_arquivo, msg_status)
 
         if not sucesso or not os.path.exists(caminho_arquivo):
