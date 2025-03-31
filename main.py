@@ -34,6 +34,9 @@ class Config:
     INTERVALO_ATUALIZACAO = 5  # Segundos entre atualizações de progresso
     USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 
+# Caminho para o arquivo de cookies
+COOKIES_PATH = "./cookies.txt"
+
 app = Client(
     "bot_upload_video",
     api_id=Config.API_ID,
@@ -51,6 +54,18 @@ LOOP = None  # Para armazenar o event loop principal
 
 # Dicionário para armazenar o status de cada download/upload
 STATUS_PROCESSOS = {}
+
+def verificar_cookies():
+    """Verifica se o arquivo de cookies existe e parece válido"""
+    if not os.path.exists(COOKIES_PATH):
+        return False
+    
+    try:
+        with open(COOKIES_PATH, 'r') as f:
+            content = f.read()
+            return "youtube.com" in content
+    except:
+        return False
 
 def eh_comentario_canal(mensagem: Message) -> bool:
     """Verifica se a mensagem é um comentário em um canal"""
@@ -148,7 +163,6 @@ def tratar_flood_wait(func):
             return await func(*args, **kwargs)
     return wrapper
 
-# Função modificada para executar no loop principal
 def progresso_download(d, mensagem_status):
     """Callback de progresso do yt-dlp que executa corretamente no event loop"""
     global DOWNLOAD_CANCELADO, TAMANHO_TOTAL_ARQUIVO, LOOP
@@ -161,7 +175,6 @@ def progresso_download(d, mensagem_status):
         total = d.get('total_bytes') or d.get('total_bytes_estimate') or TAMANHO_TOTAL_ARQUIVO
         
         if total > 0 and LOOP:
-            # Criar uma future para executar no loop principal
             asyncio.run_coroutine_threadsafe(
                 atualizar_progresso_download(baixado, total, mensagem_status),
                 LOOP
@@ -171,7 +184,6 @@ async def baixar_com_ytdlp(url, caminho_arquivo, mensagem_status):
     """Download usando yt-dlp com configurações especiais para XVideos e YouTube"""
     global DOWNLOAD_CANCELADO, TAMANHO_TOTAL_ARQUIVO, LOOP
 
-    # Armazenar o loop principal para uso na função de progresso
     LOOP = asyncio.get_running_loop()
 
     opcoes_ydl = {
@@ -209,12 +221,23 @@ async def baixar_com_ytdlp(url, caminho_arquivo, mensagem_status):
         opcoes_ydl.update({
             'format': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]',
             'merge_output_format': 'mp4',
+            'cookiefile': COOKIES_PATH if os.path.exists(COOKIES_PATH) else None,
             'postprocessors': [{
                 'key': 'FFmpegVideoConvertor',
                 'preferedformat': 'mp4'
             }],
+            'extractor_args': {
+                'youtube': {
+                    'skip': ['dash', 'hls'],
+                    'player_skip': ['configs'],
+                }
+            },
             'youtube_include_dash_manifest': False,
             'youtube_include_hls_manifest': False,
+            'http_headers': {
+                'User-Agent': Config.USER_AGENT,
+                'Accept-Language': 'en-US,en;q=0.9',
+            }
         })
     # Configuração padrão para outros sites
     else:
@@ -236,9 +259,7 @@ async def baixar_com_ytdlp(url, caminho_arquivo, mensagem_status):
 
             await asyncio.to_thread(ydl.download, [url])
 
-        # Verifica se o arquivo foi baixado corretamente
         if not os.path.exists(caminho_arquivo):
-            # Tenta encontrar o arquivo pelo nome padrão do yt-dlp
             filename = ydl.prepare_filename(info)
             if os.path.exists(filename):
                 os.rename(filename, caminho_arquivo)
@@ -246,9 +267,17 @@ async def baixar_com_ytdlp(url, caminho_arquivo, mensagem_status):
                 return False
 
         return True
+    except yt_dlp.utils.DownloadError as e:
+        if "Sign in to confirm you're not a bot" in str(e):
+            logger.error("Erro de autenticação no YouTube - Cookies necessários")
+            if os.path.exists(COOKIES_PATH):
+                await mensagem_status.edit("⚠️ Falha ao usar cookies. Eles podem ter expirado.")
+            else:
+                await mensagem_status.edit("⚠️ Este vídeo requer login no YouTube. Cookies não encontrados.")
+            return False
+        raise
     except Exception as e:
         logger.error(f"Erro ao baixar com yt-dlp: {str(e)}")
-        # Tentar fallback mais simples
         try:
             with yt_dlp.YoutubeDL({'format': 'best', 'outtmpl': caminho_arquivo, 'progress_hooks': [lambda d: progresso_download(d, mensagem_status)]}) as ydl:
                 await asyncio.to_thread(ydl.download, [url])
@@ -274,7 +303,7 @@ async def download_arquivo_generico(url, caminho_arquivo, mensagem_status):
                 if response.status == 200:
                     TAMANHO_TOTAL_ARQUIVO = int(response.headers.get('Content-Length', 0))
                     with open(caminho_arquivo, 'wb') as f:
-                        async for chunk in response.content.iter_chunked(1024*1024):  # 1MB chunks
+                        async for chunk in response.content.iter_chunked(1024*1024):
                             if DOWNLOAD_CANCELADO:
                                 logger.info("Download cancelado pelo usuário.")
                                 return False
@@ -324,20 +353,20 @@ async def callback_progresso(atual, total, mensagem):
     """Callback de progresso com controle de flood"""
     global ULTIMO_TEMPO_ATUALIZACAO, UPLOAD_CANCELADO
 
-    if UPLOAD_CANCELADO:
-        raise Exception("Upload cancelado pelo usuário")
-
-    agora = time.time()
-    if agora - ULTIMO_TEMPO_ATUALIZACAO < Config.INTERVALO_ATUALIZACAO:
-        return
-
-    ULTIMO_TEMPO_ATUALIZACAO = agora
-    percentual = (atual / total) * 100
-    tempo_decorrido = agora - TEMPO_INICIO
-    velocidade = atual / tempo_decorrido if tempo_decorrido > 0 else 0
-    tempo_restante = (total - atual) / velocidade if velocidade > 0 else 0
-
     try:
+        if UPLOAD_CANCELADO:
+            raise Exception("Upload cancelado pelo usuário")
+
+        agora = time.time()
+        if agora - ULTIMO_TEMPO_ATUALIZACAO < Config.INTERVALO_ATUALIZACAO:
+            return
+
+        ULTIMO_TEMPO_ATUALIZACAO = agora
+        percentual = (atual / total) * 100
+        tempo_decorrido = agora - TEMPO_INICIO
+        velocidade = atual / tempo_decorrido if tempo_decorrido > 0 else 0
+        tempo_restante = (total - atual) / velocidade if velocidade > 0 else 0
+
         texto = (
             f"📤 **Progresso do Upload**\n"
             f"📦 Tamanho Total: {converter_bytes(total)}\n"
@@ -347,25 +376,43 @@ async def callback_progresso(atual, total, mensagem):
         )
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Cancelar", callback_data="cancelar_upload")]])
         await mensagem.edit(texto, reply_markup=keyboard)
-    except MessageNotModified:
-        pass
     except Exception as e:
-        logger.warning(f"Falha ao atualizar progresso: {e}")
+        logger.error(f"Erro no callback de progresso: {e}")
+        raise
 
 @app.on_message(filters.command(["start", "help"]))
 @tratar_flood_wait
 async def comando_start(client, mensagem: Message):
     """Handler do comando /start e /help"""
-    await mensagem.reply(
+    texto = (
         "✅ **Bot de Upload de Arquivos Ativo!**\n\n"
         "📌 **Como usar:**\n"
         "• Envie uma URL de vídeo/imagem\n"
         "• Ou use /up <URL>\n"
         "• Para legenda direta: /leg <URL> <texto>\n"
         "• Para adicionar legenda depois: responda com /leg <texto>\n\n"
+        "🔐 **Cookies do YouTube:**\n"
+        "Envie o arquivo cookies.txt para baixar vídeos restritos\n\n"
         "💡 **Suporte a:** YouTube, XVideos e centenas de outros sites\n"
         "💡 **Em canais:** Responda a postagens com os comandos para enviar como comentário"
     )
+    await mensagem.reply(texto)
+
+@app.on_message(filters.document & filters.private)
+async def receber_cookies(client, mensagem: Message):
+    """Handler para receber arquivo de cookies"""
+    if mensagem.document.file_name == "cookies.txt":
+        try:
+            await mensagem.download(file_name=COOKIES_PATH)
+            if verificar_cookies():
+                await mensagem.reply("✅ Cookies configurados com sucesso!")
+            else:
+                os.remove(COOKIES_PATH)
+                await mensagem.reply("❌ Arquivo de cookies inválido")
+        except Exception as e:
+            await mensagem.reply(f"⚠️ Erro ao processar cookies: {str(e)}")
+    else:
+        await mensagem.reply("⚠️ Por favor, envie um arquivo chamado 'cookies.txt'")
 
 @app.on_message(filters.command(["up", "leg"]))
 @tratar_flood_wait
@@ -386,7 +433,6 @@ async def comando_upload(client, mensagem: Message):
 
         if match:
             url = match.group(1)
-            # Pega todo o texto após o comando, remove a URL e limpa os espaços
             legenda = mensagem.text.replace(match.group(0), "").replace("/leg ", "").strip()
         elif eh_resposta:
             if len(mensagem.command) < 2:
@@ -418,7 +464,6 @@ async def comando_upload(client, mensagem: Message):
 
     msg_status = await mensagem.reply("🔍 Iniciando processamento...")
 
-    # Determinar extensão baseada na URL ou tipo de conteúdo
     extensao = '.mp4'  # Padrão para vídeos
     if any(ext in url.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif']):
         extensao = os.path.splitext(url.split('?')[0])[1].lower()
@@ -426,23 +471,19 @@ async def comando_upload(client, mensagem: Message):
     caminho_arquivo = os.path.join(Config.PASTA_DOWNLOAD, f"dl_{mensagem.id}{extensao}")
 
     try:
-        # Limpar arquivos antigos com o mesmo nome
         if os.path.exists(caminho_arquivo):
             os.remove(caminho_arquivo)
 
         await msg_status.edit("⬇️ Baixando arquivo...")
 
-        # Tentar primeiro com yt-dlp para qualquer URL - MODIFICAÇÃO PRINCIPAL
+        # Tentar primeiro com yt-dlp para qualquer URL
         try:
-            # Testar se o yt-dlp reconhece a URL como site compatível
             with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
                 info_dict = await asyncio.to_thread(ydl.extract_info, url, download=False, process=False)
             
-            # Se chegou aqui, é compatível com yt-dlp
             sucesso = await baixar_com_ytdlp(url, caminho_arquivo, msg_status)
         except Exception as e:
             logger.info(f"URL não compatível com yt-dlp: {str(e)}")
-            # Se falhar, usar o método genérico para URLs diretas
             sucesso = await download_arquivo_generico(url, caminho_arquivo, msg_status)
 
         if not sucesso or not os.path.exists(caminho_arquivo):
@@ -457,7 +498,6 @@ async def comando_upload(client, mensagem: Message):
 
         await msg_status.edit("📊 Processando vídeo...")
 
-        # Preparar parâmetros de envio
         params = {
             'caption': legenda,
             'progress': callback_progresso,
@@ -469,7 +509,6 @@ async def comando_upload(client, mensagem: Message):
 
         await msg_status.edit("⬆️ Enviando arquivo...")
 
-        # Verificar tipo de arquivo e enviar
         if extensao in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']:
             await client.send_photo(
                 chat_id=mensagem.chat.id,
@@ -509,7 +548,6 @@ async def comando_upload(client, mensagem: Message):
         logger.error(f"Erro no processamento: {str(e)}")
         await msg_status.edit(f"⚠️ Erro: {str(e)[:200]}")
     finally:
-        # Limpeza de arquivos temporários
         if os.path.exists(caminho_arquivo):
             os.remove(caminho_arquivo)
         thumb_path = os.path.join(Config.PASTA_THUMB, f"thumb_{os.path.basename(caminho_arquivo)}.jpg")
@@ -542,17 +580,13 @@ async def lidar_com_links_automaticos(client, mensagem: Message):
 
         await msg_status.edit("⬇️ Baixando vídeo...")
 
-        # Tentar primeiro com yt-dlp para qualquer URL - MODIFICAÇÃO PRINCIPAL
         try:
-            # Testar se o yt-dlp reconhece a URL como site compatível
             with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
                 info_dict = await asyncio.to_thread(ydl.extract_info, url, download=False, process=False)
             
-            # Se chegou aqui, é compatível com yt-dlp
             sucesso = await baixar_com_ytdlp(url, caminho_arquivo, msg_status)
         except Exception as e:
             logger.info(f"URL não compatível com yt-dlp: {str(e)}")
-            # Se falhar, usar o método genérico para URLs diretas
             sucesso = await download_arquivo_generico(url, caminho_arquivo, msg_status)
 
         if not sucesso or not os.path.exists(caminho_arquivo):
