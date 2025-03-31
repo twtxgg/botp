@@ -10,6 +10,10 @@ import time
 from functools import wraps
 import subprocess
 import re
+from dotenv import load_dotenv  # Novo import
+
+# Carrega variáveis do arquivo .env
+load_dotenv()
 
 # Configuração de logging
 logging.basicConfig(
@@ -24,24 +28,53 @@ logger = logging.getLogger(__name__)
 
 # Configurações do bot
 class Config:
-    BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-    API_ID = int(os.environ.get("API_ID", 0))
-    API_HASH = os.environ.get("API_HASH", "")
-    DONO_ID = 940793418
+    # Credenciais principais (obrigatórias)
+    BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+    API_ID = int(os.getenv("API_ID", 0))
+    API_HASH = os.getenv("API_HASH", "")
+    
+    # Configurações personalizadas
+    DONO_ID = int(os.getenv("DONO_ID", 940793418))
     PASTA_DOWNLOAD = "./downloads"
     PASTA_THUMB = "./thumb_cache"
     TAMANHO_MAXIMO = 2000 * 1024 * 1024  # 2GB
-    INTERVALO_ATUALIZACAO = 5  # Segundos entre atualizações de progresso
+    INTERVALO_ATUALIZACAO = 5  # Segundos entre atualizações
     USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 
-# Caminho para o arquivo de cookies
+# Verificação de credenciais
+def verificar_credenciais():
+    credenciais_ausentes = []
+    if not Config.BOT_TOKEN:
+        credenciais_ausentes.append("BOT_TOKEN")
+    if not Config.API_ID:
+        credenciais_ausentes.append("API_ID")
+    if not Config.API_HASH:
+        credenciais_ausentes.append("API_HASH")
+    
+    if credenciais_ausentes:
+        logger.error(f"Credenciais ausentes: {', '.join(credenciais_ausentes)}")
+        print("\nERRO: Configure o arquivo .env com:")
+        print("BOT_TOKEN=seu_token_do_bot")
+        print("API_ID=seu_api_id")
+        print("API_HASH=seu_api_hash")
+        print("\nObtenha em:")
+        print("- @BotFather (para BOT_TOKEN)")
+        print("- my.telegram.org (para API_ID/HASH)")
+        exit(1)
+
+verificar_credenciais()
+
+# Caminho para cookies
 COOKIES_PATH = "./cookies.txt"
 
+# Inicializa o Pyrogram Client
 app = Client(
-    "bot_upload_video",
+    name="bot_upload_video",
     api_id=Config.API_ID,
     api_hash=Config.API_HASH,
-    bot_token=Config.BOT_TOKEN
+    bot_token=Config.BOT_TOKEN,
+    workers=3,
+    sleep_threshold=60
 )
 
 # Variáveis globais
@@ -669,20 +702,14 @@ if __name__ == "__main__":
     os.makedirs(Config.PASTA_DOWNLOAD, exist_ok=True)
     os.makedirs(Config.PASTA_THUMB, exist_ok=True)
 
-    # Limpa arquivos temporários antigos
-    for file in os.listdir(Config.PASTA_DOWNLOAD):
-        if file.startswith('dl_'):
-            try:
-                os.remove(os.path.join(Config.PASTA_DOWNLOAD, file))
-            except:
-                pass
-
-    for file in os.listdir(Config.PASTA_THUMB):
-        if file.startswith('thumb_'):
-            try:
-                os.remove(os.path.join(Config.PASTA_THUMB, file))
-            except:
-                pass
+    # Limpa arquivos temporários
+    for folder in [Config.PASTA_DOWNLOAD, Config.PASTA_THUMB]:
+        for file in os.listdir(folder):
+            if file.startswith(('dl_', 'thumb_')):
+                try:
+                    os.remove(os.path.join(folder, file))
+                except:
+                    pass
 
     logger.info("----- Bot Iniciado -----")
     app.run()
