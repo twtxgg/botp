@@ -10,6 +10,15 @@ import time
 from functools import wraps
 import subprocess
 import re
+import os
+from dotenv import load_dotenv
+
+load_dotenv()  # Carrega as variáveis do .env
+
+print("Verificando variáveis:")
+print("BOT_TOKEN:", bool(os.getenv("BOT_TOKEN")))  # Deve mostrar True
+print("API_ID:", bool(os.getenv("API_ID")))        # Deve mostrar True
+print("API_HASH:", bool(os.getenv("API_HASH")))    # Deve mostrar True
 
 # Configuração de logging
 logging.basicConfig(
