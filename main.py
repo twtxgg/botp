@@ -10,11 +10,8 @@ import time
 from functools import wraps
 import subprocess
 import re
-from dotenv import load_dotenv
 
-# ==================== CONFIGURAÇÃO INICIAL ====================
-load_dotenv()
-
+# Configuração de logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -25,58 +22,53 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Configurações do bot
 class Config:
-    BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-    API_ID = int(os.getenv("API_ID", 0))
-    API_HASH = os.getenv("API_HASH", "")
-    DONO_ID = int(os.getenv("DONO_ID", 940793418))
+    BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+    API_ID = int(os.environ.get("API_ID", 0))
+    API_HASH = os.environ.get("API_HASH", "")
+    DONO_ID = 940793418
     PASTA_DOWNLOAD = "./downloads"
     PASTA_THUMB = "./thumb_cache"
     TAMANHO_MAXIMO = 2000 * 1024 * 1024  # 2GB
-    INTERVALO_ATUALIZACAO = 5
+    INTERVALO_ATUALIZACAO = 5  # Segundos entre atualizações de progresso
     USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 
-COOKIES_PATH = "./cookies.txt"
+app = Client(
+    "bot_upload_video",
+    api_id=Config.API_ID,
+    api_hash=Config.API_HASH,
+    bot_token=Config.BOT_TOKEN
+)
 
-# ==================== VERIFICAÇÕES ====================
-def verificar_credenciais():
-    required = {
-        "BOT_TOKEN": Config.BOT_TOKEN,
-        "API_ID": Config.API_ID,
-        "API_HASH": Config.API_HASH
-    }
-    missing = [k for k, v in required.items() if not v]
-    if missing:
-        logger.error(f"Credenciais ausentes: {', '.join(missing)}")
-        print("\nERRO: Configure o arquivo .env com:")
-        print("BOT_TOKEN=seu_token_do_bot")
-        print("API_ID=seu_api_id")
-        print("API_HASH=seu_api_hash")
-        exit(1)
+# Variáveis globais
+ULTIMO_TEMPO_ATUALIZACAO = 0
+TEMPO_INICIO = 0
+DOWNLOAD_CANCELADO = False
+UPLOAD_CANCELADO = False
+TAMANHO_TOTAL_ARQUIVO = 0
 
-def verificar_cookies():
-    if not os.path.exists(COOKIES_PATH):
-        return False
-    try:
-        with open(COOKIES_PATH, 'r') as f:
-            return "youtube.com" in f.read()
-    except:
-        return False
-
-# ==================== FUNÇÕES AUXILIARES ====================
 def eh_comentario_canal(mensagem: Message) -> bool:
+    """Verifica se a mensagem é um comentário em um canal"""
     return (mensagem.chat.type == enums.ChatType.CHANNEL and 
             mensagem.reply_to_message is not None)
 
 async def apagar_url_se_permitido(client: Client, mensagem: Message, eh_resposta: bool):
+    """
+    Tenta apagar a URL conforme as permissões
+    - Funciona em grupos, canais e comentários de canais
+    - Não apaga em chats privados
+    """
     try:
         if eh_resposta or mensagem.chat.type in [enums.ChatType.SUPERGROUP, enums.ChatType.CHANNEL, enums.ChatType.GROUP]:
             await asyncio.sleep(2)
             await mensagem.delete()
+            logger.info(f"URL removida com sucesso (ID: {mensagem.id})")
     except Exception as e:
-        logger.error(f"Erro ao apagar URL: {e}")
+        logger.error(f"Falha ao remover URL: {str(e)}")
 
 def converter_bytes(tamanho):
+    """Converte bytes para formato legível (KB, MB, GB)"""
     unidades = ["B", "KB", "MB", "GB", "TB"]
     tamanho = float(tamanho)
     i = 0
@@ -86,113 +78,200 @@ def converter_bytes(tamanho):
     return f"{tamanho:.2f} {unidades[i]}"
 
 def criar_barra_progresso(percentual):
+    """Gera barra de progresso visual"""
     preenchido = int(percentual/10)
     return f"[{'■' * preenchido}{'□' * (10 - preenchido)}]"
 
-# ==================== PROCESSAMENTO DE MÍDIA ====================
 def extrair_metadados_video(caminho_arquivo):
+    """Extrai metadados do vídeo (duração, dimensões, thumbnail)"""
     try:
-        if not os.path.exists(caminho_arquivo) or os.path.getsize(caminho_arquivo) == 0:
-            raise Exception("Arquivo inválido")
+        if not os.path.exists(caminho_arquivo):
+            raise Exception("Arquivo não encontrado")
 
-        duracao = float(subprocess.check_output([
+        if os.path.getsize(caminho_arquivo) == 0:
+            raise Exception("Arquivo vazio")
+
+        comando_duracao = [
             'ffprobe', '-v', 'error',
             '-show_entries', 'format=duration',
             '-of', 'default=noprint_wrappers=1:nokey=1',
             caminho_arquivo
-        ]).decode('utf-8').strip())
-
-        dimensoes = subprocess.check_output([
+        ]
+        comando_dimensoes = [
             'ffprobe', '-v', 'error',
             '-select_streams', 'v:0',
             '-show_entries', 'stream=width,height',
             '-of', 'csv=p=0',
             caminho_arquivo
-        ]).decode('utf-8').strip().split(',')
+        ]
 
-        thumb_path = os.path.join(Config.PASTA_THUMB, f"thumb_{os.path.basename(caminho_arquivo)}.jpg")
+        duracao = float(subprocess.check_output(comando_duracao).decode('utf-8').strip())
+        dimensoes = subprocess.check_output(comando_dimensoes).decode('utf-8').strip().split(',')
+
+        caminho_thumbnail = os.path.join(Config.PASTA_THUMB, f"thumb_{os.path.basename(caminho_arquivo)}.jpg")
+        if os.path.exists(caminho_thumbnail):
+            os.remove(caminho_thumbnail)
+
+        tempo_busca = min(30, float(duracao) - 1)
+
         subprocess.run([
-            'ffmpeg', '-y', '-ss', str(min(30, duracao - 1)),
-            '-i', caminho_arquivo, '-vframes', '1', '-q:v', '2', thumb_path
+            'ffmpeg', '-y', '-ss', str(tempo_busca), '-i', caminho_arquivo,
+            '-vframes', '1', '-q:v', '2', caminho_thumbnail
         ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
         return {
             'duracao': int(duracao),
             'largura': int(dimensoes[0]),
             'altura': int(dimensoes[1]),
-            'caminho_thumbnail': thumb_path if os.path.exists(thumb_path) else None
+            'caminho_thumbnail': caminho_thumbnail if os.path.exists(caminho_thumbnail) else None
         }
+
     except Exception as e:
-        logger.error(f"Erro nos metadados: {e}")
+        logger.error(f"Erro ao extrair metadados: {str(e)}")
         return None
 
-# ==================== DOWNLOAD ====================
-async def progresso_download(d, mensagem_status):
-    global DOWNLOAD_CANCELADO, TAMANHO_TOTAL_ARQUIVO
-
-    if DOWNLOAD_CANCELADO:
-        raise Exception("Download cancelado")
-
-    if d['status'] == 'downloading':
-        baixado = d.get('downloaded_bytes', 0)
-        total = d.get('total_bytes') or d.get('total_bytes_estimate') or TAMANHO_TOTAL_ARQUIVO
-        
-        if total > 0:
-            await atualizar_progresso_download(baixado, total, mensagem_status)
+def tratar_flood_wait(func):
+    """Decorator para tratamento de FloodWait"""
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await func(*args, **kwargs)
+        except FloodWait as e:
+            logger.warning(f"FloodWait: Esperando {e.x} segundos")
+            await asyncio.sleep(e.x)
+            return await func(*args, **kwargs)
+    return wrapper
 
 async def baixar_com_ytdlp(url, caminho_arquivo, mensagem_status):
-    global TAMANHO_TOTAL_ARQUIVO
+    """Download usando yt-dlp com suporte a cookies"""
+    global DOWNLOAD_CANCELADO, TAMANHO_TOTAL_ARQUIVO
 
-    ydl_opts = {
+    opcoes_ydl = {
         'outtmpl': caminho_arquivo,
         'quiet': True,
-        'progress_hooks': [lambda d: asyncio.create_task(progresso_download(d, mensagem_status))],
-        'cookiefile': COOKIES_PATH if os.path.exists(COOKIES_PATH) else None,
-        'http_headers': {'User-Agent': Config.USER_AGENT},
-        'format': 'bestvideo[height<=1080]+bestaudio/best[height<=1080]',
-        'merge_output_format': 'mp4'
+        'no_warnings': True,
+        'geo_bypass': True,
+        'noplaylist': True,
+        'restrictfilenames': True,
+        'retries': 3,
+        'fragment_retries': 3,
+        'continue_dl': True,
+        'socket_timeout': 30,
+        'cookiefile': 'cookies.txt',
+        'extractor_retries': 5,
+        'sleep_interval': 5,
+        'max_sleep_interval': 30,
+        'ignoreerrors': True,
     }
 
+    if 'xvideos.com' in url:
+        opcoes_ydl.update({
+            'format': 'best',
+            'headers': {
+                'User-Agent': Config.USER_AGENT,
+                'Referer': 'https://www.xvideos.com/',
+                'Accept': '*/*',
+            },
+            'extractor_args': {
+                'generic': {
+                    'no-check-certificate': True,
+                    'prefer-insecure': True
+                }
+            }
+        })
+    elif 'youtube.com' in url or 'youtu.be' in url:
+        opcoes_ydl.update({
+            'format': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]',
+            'merge_output_format': 'mp4',
+            'postprocessors': [{
+                'key': 'FFmpegVideoConvertor',
+                'preferedformat': 'mp4'
+            }],
+            'youtube_include_dash_manifest': False,
+            'youtube_include_hls_manifest': False,
+            'extractor_args': {
+                'youtube': {
+                    'skip': ['dash', 'hls']
+                }
+            },
+            'throttledratelimit': 1000000,
+        })
+    else:
+        opcoes_ydl.update({
+            'format': 'best[ext=mp4]/best',
+            'postprocessors': [{
+                'key': 'FFmpegVideoConvertor',
+                'preferedformat': 'mp4'
+            }]
+        })
+
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(opcoes_ydl) as ydl:
             info = await asyncio.to_thread(ydl.extract_info, url, download=False)
-            TAMANHO_TOTAL_ARQUIVO = info.get('filesize') or info.get('total_bytes') or 0
+            
+            TAMANHO_TOTAL_ARQUIVO = info.get('filesize') or info.get('filesize_approx') or 0
+            
             await asyncio.to_thread(ydl.download, [url])
-        
-        return os.path.exists(caminho_arquivo)
-    except yt_dlp.utils.DownloadError as e:
-        if "Sign in to confirm" in str(e):
-            await mensagem_status.edit("⚠️ Cookies do YouTube necessários")
-        return False
+            
+        if not os.path.exists(caminho_arquivo):
+            filename = ydl.prepare_filename(info)
+            if os.path.exists(filename):
+                os.rename(filename, caminho_arquivo)
+            else:
+                return False
+                
+        return True
     except Exception as e:
-        logger.error(f"Erro no yt-dlp: {e}")
-        return False
+        logger.error(f"Erro ao baixar com yt-dlp: {str(e)}")
+        try:
+            with yt_dlp.YoutubeDL({
+                'format': 'best',
+                'outtmpl': caminho_arquivo,
+                'cookiefile': 'cookies.txt',
+                'ignoreerrors': True
+            }) as ydl:
+                await asyncio.to_thread(ydl.download, [url])
+            return os.path.exists(caminho_arquivo)
+        except Exception as e2:
+            logger.error(f"Fallback também falhou: {str(e2)}")
+            return False
 
 async def download_arquivo_generico(url, caminho_arquivo, mensagem_status):
-    global TAMANHO_TOTAL_ARQUIVO
-
+    """Download de qualquer tipo de arquivo genérico"""
+    global DOWNLOAD_CANCELADO, TAMANHO_TOTAL_ARQUIVO
+    baixado = 0
     try:
-        async with aiohttp.ClientSession(headers={'User-Agent': Config.USER_AGENT}) as session:
-            async with session.get(url) as response:
-                if response.status != 200:
-                    return False
+        headers = {'User-Agent': Config.USER_AGENT}
+        if 'xvideos.com' in url:
+            headers.update({
+                'Referer': 'https://www.xvideos.com/',
+                'Accept': '*/*'
+            })
 
-                TAMANHO_TOTAL_ARQUIVO = int(response.headers.get('Content-Length', 0))
-                with open(caminho_arquivo, 'wb') as f:
-                    async for chunk in response.content.iter_chunked(1024*1024):
-                        if DOWNLOAD_CANCELADO:
-                            return False
-                        f.write(chunk)
-                        await atualizar_progresso_download(f.tell(), TAMANHO_TOTAL_ARQUIVO, mensagem_status)
-                return True
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(url) as response:
+                if response.status == 200:
+                    TAMANHO_TOTAL_ARQUIVO = int(response.headers.get('Content-Length', 0))
+                    with open(caminho_arquivo, 'wb') as f:
+                        async for chunk in response.content.iter_chunked(1024*1024):
+                            if DOWNLOAD_CANCELADO:
+                                logger.info("Download cancelado pelo usuário.")
+                                return False
+                            f.write(chunk)
+                            baixado += len(chunk)
+                            await atualizar_progresso_download(baixado, TAMANHO_TOTAL_ARQUIVO, mensagem_status)
+                    return True
+                else:
+                    logger.error(f"Erro HTTP {response.status} ao baixar arquivo")
+                    return False
     except Exception as e:
-        logger.error(f"Erro no download: {e}")
+        logger.error(f"Erro ao baixar arquivo: {e}")
         return False
 
-# ==================== UPLOAD E PROGRESSO ====================
 @tratar_flood_wait
 async def atualizar_progresso_download(baixado, total, mensagem):
-    global ULTIMO_TEMPO_ATUALIZACAO
+    """Atualiza a mensagem de progresso do download"""
+    global ULTIMO_TEMPO_ATUALIZACAO, TEMPO_INICIO
 
     agora = time.time()
     if agora - ULTIMO_TEMPO_ATUALIZACAO < Config.INTERVALO_ATUALIZACAO:
@@ -200,34 +279,32 @@ async def atualizar_progresso_download(baixado, total, mensagem):
 
     ULTIMO_TEMPO_ATUALIZACAO = agora
     percentual = (baixado / total) * 100 if total > 0 else 0
-    velocidade = baixado / (agora - TEMPO_INICIO) if (agora - TEMPO_INICIO) > 0 else 0
+    tempo_decorrido = agora - TEMPO_INICIO
+    velocidade = baixado / tempo_decorrido if tempo_decorrido > 0 else 0
     tempo_restante = (total - baixado) / velocidade if velocidade > 0 else 0
 
     try:
         texto = (
-            f"⬇️ **Download Progress**\n"
+            f"⬇️ **Progresso do Download**\n"
+            f"📦 Tamanho Total: {converter_bytes(total)}\n"
             f"{criar_barra_progresso(percentual)} {percentual:.1f}%\n"
-            f"📦 {converter_bytes(baixado)}/{converter_bytes(total)}\n"
             f"⚡ {converter_bytes(velocidade)}/s\n"
             f"⏱️ {tempo_restante:.0f}s restantes"
         )
-        await mensagem.edit_text(
-            texto,
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("❌ Cancelar", callback_data="cancelar_download")
-            ]])
-        )
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Cancelar", callback_data="cancelar_download")]])
+        await mensagem.edit(texto, reply_markup=keyboard)
     except MessageNotModified:
         pass
     except Exception as e:
-        logger.warning(f"Erro ao atualizar progresso: {e}")
+        logger.warning(f"Falha ao atualizar progresso do download: {e}")
 
 @tratar_flood_wait
 async def callback_progresso(atual, total, mensagem):
+    """Callback de progresso com controle de flood"""
     global ULTIMO_TEMPO_ATUALIZACAO, UPLOAD_CANCELADO
 
     if UPLOAD_CANCELADO:
-        raise Exception("Upload cancelado")
+        raise Exception("Upload cancelado pelo usuário")
 
     agora = time.time()
     if agora - ULTIMO_TEMPO_ATUALIZACAO < Config.INTERVALO_ATUALIZACAO:
@@ -235,174 +312,329 @@ async def callback_progresso(atual, total, mensagem):
 
     ULTIMO_TEMPO_ATUALIZACAO = agora
     percentual = (atual / total) * 100
-    velocidade = atual / (agora - TEMPO_INICIO)
+    tempo_decorrido = agora - TEMPO_INICIO
+    velocidade = atual / tempo_decorrido if tempo_decorrido > 0 else 0
     tempo_restante = (total - atual) / velocidade if velocidade > 0 else 0
 
     try:
         texto = (
-            f"📤 **Upload Progress**\n"
+            f"📤 **Progresso do Upload**\n"
+            f"📦 Tamanho Total: {converter_bytes(total)}\n"
             f"{criar_barra_progresso(percentual)} {percentual:.1f}%\n"
-            f"📦 {converter_bytes(atual)}/{converter_bytes(total)}\n"
             f"⚡ {converter_bytes(velocidade)}/s\n"
             f"⏱️ {tempo_restante:.0f}s restantes"
         )
-        await mensagem.edit_text(
-            texto,
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("❌ Cancelar", callback_data="cancelar_upload")
-            ]])
-        )
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Cancelar", callback_data="cancelar_upload")]])
+        await mensagem.edit(texto, reply_markup=keyboard)
     except MessageNotModified:
         pass
     except Exception as e:
-        logger.warning(f"Erro no progresso: {e}")
+        logger.warning(f"Falha ao atualizar progresso: {e}")
 
-# ==================== HANDLERS ====================
 @app.on_message(filters.command(["start", "help"]))
 @tratar_flood_wait
-async def comando_start(client, message: Message):
-    await message.reply(
-        "🤖 **Bot de Upload de Vídeos**\n\n"
+async def comando_start(client, mensagem: Message):
+    """Handler do comando /start e /help"""
+    await mensagem.reply(
+        "✅ **Bot de Upload de Arquivos Ativo!**\n\n"
         "📌 **Como usar:**\n"
-        "- Envie um link direto\n"
-        "- Ou use /up <link>\n"
-        "- Para legendas use /leg <link> <texto>\n\n"
-        "🔐 Suporta cookies do YouTube (envie cookies.txt)"
+        "• Envie uma URL de vídeo/imagem\n"
+        "• Ou use /up <URL>\n"
+        "• Para legenda direta: /leg <URL> <texto>\n"
+        "• Para adicionar legenda depois: responda com /leg <texto>\n\n"
+        "💡 **Suporte a:** YouTube, XVideos e centenas de outros sites\n"
+        "💡 **Em canais:** Responda a postagens com os comandos para enviar como comentário"
     )
 
-@app.on_message(filters.document & filters.private)
-async def receber_cookies(client, message: Message):
-    if message.document.file_name == "cookies.txt":
-        try:
-            await message.download(file_name=COOKIES_PATH)
-            await message.reply("✅ Cookies configurados!" if verificar_cookies() else "❌ Cookies inválidos")
-        except Exception as e:
-            await message.reply(f"⚠️ Erro: {e}")
-
-@app.on_message(filters.command(["up", "leg"]) | (filters.text & ~filters.command))
+@app.on_message(filters.command(["ajuda_cookies"]))
 @tratar_flood_wait
-async def handle_links(client, message: Message):
+async def comando_ajuda_cookies(client, mensagem: Message):
+    """Explica como configurar cookies para YouTube"""
+    ajuda_texto = (
+        "🔐 **Como configurar cookies para o YouTube**\n\n"
+        "1. Instale a extensão 'Get cookies.txt' no seu navegador\n"
+        "2. Acesse youtube.com e faça login\n"
+        "3. Use a extensão para exportar os cookies\n"
+        "4. Renomeie o arquivo para 'cookies.txt'\n"
+        "5. Coloque o arquivo na mesma pasta do bot\n\n"
+        "📌 Isso resolverá os problemas de 'confirm you're not a bot'"
+    )
+    await mensagem.reply(ajuda_texto)
+
+@app.on_message(filters.command(["up", "leg"]))
+@tratar_flood_wait
+async def comando_upload(client, mensagem: Message):
+    """Manipula os comandos /up e /leg"""
     global TEMPO_INICIO, DOWNLOAD_CANCELADO, UPLOAD_CANCELADO, TAMANHO_TOTAL_ARQUIVO
     
+    if ('youtube.com' in mensagem.text or 'youtu.be' in mensagem.text) and not os.path.exists('cookies.txt'):
+        await mensagem.reply("⚠️ Aviso: Para downloads do YouTube, recomendo configurar cookies. Veja /ajuda_cookies")
+    
     TEMPO_INICIO = time.time()
-    DOWNLOAD_CANCELADO = UPLOAD_CANCELADO = False
+    DOWNLOAD_CANCELADO = False
+    UPLOAD_CANCELADO = False
     TAMANHO_TOTAL_ARQUIVO = 0
 
-    # Extrai URL e legenda
-    url = message.text.split()[1] if message.command and len(message.command) > 1 else message.text
-    legenda = " ".join(message.text.split()[2:]) if message.command and message.command[0] == "leg" else None
+    eh_resposta = mensagem.reply_to_message is not None
+    mensagem_original = mensagem.reply_to_message if eh_resposta else None
 
-    if not url.startswith(('http://', 'https://')):
-        return await message.reply("❌ Link inválido")
+    if mensagem.command[0] == "leg" and len(mensagem.command) > 1:
+        padrao_url = re.compile(r'(https?://\S+)')
+        match = padrao_url.search(mensagem.text)
 
-    msg_status = await message.reply("🔍 Processando...")
-    ext = os.path.splitext(url.split('?')[0])[1].lower() if any(x in url.lower() for x in ['.jpg','.png','.gif']) else '.mp4'
-    caminho_arquivo = os.path.join(Config.PASTA_DOWNLOAD, f"dl_{message.id}{ext}")
+        if match:
+            url = match.group(1)
+            legenda = mensagem.text.replace(match.group(0), "").replace("/leg ", "").strip()
+        elif eh_resposta:
+            if len(mensagem.command) < 2:
+                await mensagem.reply("❌ Use /leg <URL> <texto> ou responda uma mídia com /leg <texto>")
+                return
+
+            legenda = mensagem.text.split(maxsplit=1)[1]
+
+            try:
+                if mensagem_original.caption is not None:
+                    await mensagem_original.edit_caption(legenda)
+                else:
+                    await mensagem_original.edit_caption(caption=legenda)
+                await mensagem.delete()
+                return
+            except Exception as e:
+                logger.error(f"Erro ao adicionar legenda: {str(e)}")
+                await mensagem.reply(f"⚠️ Erro ao adicionar legenda: {str(e)}")
+                return
+        else:
+            await mensagem.reply("❌ Formato incorreto. Use: /leg http://exemplo.com/video.mp4 sua legenda aqui")
+            return
+    elif mensagem.command[0] == "up" and len(mensagem.command) > 1:
+        url = mensagem.text.split(maxsplit=1)[1]
+        legenda = None
+    else:
+        await mensagem.reply("❌ Use /up <URL> ou /leg <URL> <texto>")
+        return
+
+    msg_status = await mensagem.reply("🔍 Iniciando processamento...")
+
+    extensao = '.mp4'
+    if any(ext in url.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif']):
+        extensao = os.path.splitext(url.split('?')[0])[1].lower()
+
+    caminho_arquivo = os.path.join(Config.PASTA_DOWNLOAD, f"dl_{mensagem.id}{extensao}")
 
     try:
-        # Download
-        await msg_status.edit("⬇️ Baixando...")
-        sucesso = await baixar_com_ytdlp(url, caminho_arquivo, msg_status) or \
-                 await download_arquivo_generico(url, caminho_arquivo, msg_status)
+        if os.path.exists(caminho_arquivo):
+            os.remove(caminho_arquivo)
+
+        await msg_status.edit("⬇️ Baixando arquivo...")
+
+        try:
+            with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+                info_dict = await asyncio.to_thread(ydl.extract_info, url, download=False, process=False)
+            
+            sucesso = await baixar_com_ytdlp(url, caminho_arquivo, msg_status)
+        except Exception as e:
+            logger.info(f"URL não compatível com yt-dlp: {str(e)}")
+            sucesso = await download_arquivo_generico(url, caminho_arquivo, msg_status)
 
         if not sucesso or not os.path.exists(caminho_arquivo):
-            return await msg_status.edit("❌ Falha no download")
+            await msg_status.edit("❌ Falha no download do arquivo")
+            return
 
-        # Verifica tamanho
-        if os.path.getsize(caminho_arquivo) > Config.TAMANHO_MAXIMO:
+        tamanho_arquivo = os.path.getsize(caminho_arquivo)
+        if tamanho_arquivo > Config.TAMANHO_MAXIMO:
             os.remove(caminho_arquivo)
-            return await msg_status.edit("⚠️ Arquivo muito grande")
+            await msg_status.edit(f"❌ Arquivo muito grande ({converter_bytes(tamanho_arquivo)})")
+            return
 
-        # Processa e envia
-        await msg_status.edit("📊 Processando...")
-        if ext in ['.jpg','.jpeg','.png','.gif']:
+        await msg_status.edit("📊 Processando vídeo...")
+
+        params = {
+            'caption': legenda,
+            'progress': callback_progresso,
+            'progress_args': (msg_status,)
+        }
+
+        if eh_resposta:
+            params['reply_to_message_id'] = mensagem_original.id
+
+        await msg_status.edit("⬆️ Enviando arquivo...")
+
+        if extensao in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']:
             await client.send_photo(
-                chat_id=message.chat.id,
+                chat_id=mensagem.chat.id,
                 photo=caminho_arquivo,
-                caption=legenda,
-                progress=callback_progresso,
-                progress_args=(msg_status,)
+                **params
             )
-        else:
-            metadata = extrair_metadados_video(caminho_arquivo)
-            if metadata:
+        elif extensao in ['.mp4', '.mkv', '.avi', '.mov', '.webm']:
+            metadados = extrair_metadados_video(caminho_arquivo)
+            if metadados:
                 await client.send_video(
-                    chat_id=message.chat.id,
+                    chat_id=mensagem.chat.id,
                     video=caminho_arquivo,
-                    duration=metadata['duracao'],
-                    width=metadata['largura'],
-                    height=metadata['altura'],
-                    thumb=metadata['caminho_thumbnail'],
-                    caption=legenda,
+                    duration=metadados['duracao'],
+                    width=metadados['largura'],
+                    height=metadados['altura'],
+                    thumb=metadados['caminho_thumbnail'] or None,
                     supports_streaming=True,
-                    progress=callback_progresso,
-                    progress_args=(msg_status,)
+                    **params
                 )
             else:
                 await client.send_document(
-                    chat_id=message.chat.id,
+                    chat_id=mensagem.chat.id,
                     document=caminho_arquivo,
-                    caption=legenda,
-                    progress=callback_progresso,
-                    progress_args=(msg_status,)
+                    **params
                 )
+        else:
+            await client.send_document(
+                chat_id=mensagem.chat.id,
+                document=caminho_arquivo,
+                **params
+            )
 
         await msg_status.delete()
-        await apagar_url_se_permitido(client, message, message.reply_to_message is not None)
+        await apagar_url_se_permitido(client, mensagem, eh_resposta)
 
     except Exception as e:
-        logger.error(f"Erro: {e}")
+        logger.error(f"Erro no processamento: {str(e)}")
         await msg_status.edit(f"⚠️ Erro: {str(e)[:200]}")
     finally:
         if os.path.exists(caminho_arquivo):
             os.remove(caminho_arquivo)
+        thumb_path = os.path.join(Config.PASTA_THUMB, f"thumb_{os.path.basename(caminho_arquivo)}.jpg")
+        if os.path.exists(thumb_path):
+            os.remove(thumb_path)
 
-@app.on_callback_query(filters.regex("cancelar_(download|upload)"))
-async def cancelar_operacao(client, callback_query):
-    global DOWNLOAD_CANCELADO, UPLOAD_CANCELADO
+@app.on_message(filters.text & ~filters.command(["start", "help", "up", "leg", "ajuda_cookies"]))
+@tratar_flood_wait
+async def lidar_com_links_automaticos(client, mensagem: Message):
+    """Handler para links automáticos (sem comando)"""
+    global TEMPO_INICIO, DOWNLOAD_CANCELADO, UPLOAD_CANCELADO, TAMANHO_TOTAL_ARQUIVO
     
-    if "download" in callback_query.data:
-        DOWNLOAD_CANCELADO = True
-    else:
-        UPLOAD_CANCELADO = True
+    if ('youtube.com' in mensagem.text or 'youtu.be' in mensagem.text) and not os.path.exists('cookies.txt'):
+        await mensagem.reply("⚠️ Aviso: Para downloads do YouTube, recomendo configurar cookies. Veja /ajuda_cookies")
     
-    await callback_query.answer("Operação cancelada")
-    await callback_query.edit_message_text("❌ Operação cancelada pelo usuário")
+    TEMPO_INICIO = time.time()
+    DOWNLOAD_CANCELADO = False
+    UPLOAD_CANCELADO = False
+    TAMANHO_TOTAL_ARQUIVO = 0
 
-# ==================== INICIALIZAÇÃO ====================
-app = Client(
-    "bot_upload_video",
-    api_id=Config.API_ID,
-    api_hash=Config.API_HASH,
-    bot_token=Config.BOT_TOKEN
-)
+    eh_resposta = mensagem.reply_to_message is not None
+    mensagem_original = mensagem.reply_to_message if eh_resposta else None
 
-async def iniciar_bot():
-    await app.start()
-    logger.info("✅ Bot iniciado com sucesso!")
-    await asyncio.Event().wait()
+    url = mensagem.text.strip()
+    if not url.startswith(('http://', 'https://')):
+        return
+
+    msg_status = await mensagem.reply("🔍 Processando link automaticamente...")
+    caminho_arquivo = os.path.join(Config.PASTA_DOWNLOAD, f"dl_{mensagem.id}.mp4")
+
+    try:
+        if os.path.exists(caminho_arquivo):
+            os.remove(caminho_arquivo)
+
+        await msg_status.edit("⬇️ Baixando vídeo...")
+
+        try:
+            with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+                info_dict = await asyncio.to_thread(ydl.extract_info, url, download=False, process=False)
+            
+            sucesso = await baixar_com_ytdlp(url, caminho_arquivo, msg_status)
+        except Exception as e:
+            logger.info(f"URL não compatível com yt-dlp: {str(e)}")
+            sucesso = await download_arquivo_generico(url, caminho_arquivo, msg_status)
+
+        if not sucesso or not os.path.exists(caminho_arquivo):
+            await msg_status.edit("❌ Falha no download do vídeo")
+            return
+
+        tamanho_arquivo = os.path.getsize(caminho_arquivo)
+        if tamanho_arquivo > Config.TAMANHO_MAXIMO:
+            os.remove(caminho_arquivo)
+            await msg_status.edit(f"❌ Arquivo muito grande ({converter_bytes(tamanho_arquivo)})")
+            return
+
+        await msg_status.edit("📊 Processando vídeo...")
+        metadados = extrair_metadados_video(caminho_arquivo)
+        if not metadados:
+            await msg_status.edit("❌ Falha ao extrair metadados do vídeo")
+            os.remove(caminho_arquivo)
+            return
+
+        await msg_status.edit("⬆️ Enviando vídeo...")
+
+        params = {
+            'chat_id': mensagem.chat.id,
+            'video': caminho_arquivo,
+            'duration': metadados['duracao'],
+            'width': metadados['largura'],
+            'height': metadados['altura'],
+            'thumb': metadados['caminho_thumbnail'] or None,
+            'supports_streaming': True,
+            'progress': callback_progresso,
+            'progress_args': (msg_status,)
+        }
+
+        if eh_resposta:
+            params['reply_to_message_id'] = mensagem_original.id
+
+        await client.send_video(**params)
+
+        await msg_status.delete()
+        await apagar_url_se_permitido(client, mensagem, eh_resposta)
+
+    except Exception as e:
+        logger.error(f"Erro no processamento automático: {str(e)}")
+        await msg_status.edit(f"⚠️ Erro: {str(e)[:200]}")
+    finally:
+        if os.path.exists(caminho_arquivo):
+            os.remove(caminho_arquivo)
+        thumb_path = os.path.join(Config.PASTA_THUMB, f"thumb_{os.path.basename(caminho_arquivo)}.jpg")
+        if os.path.exists(thumb_path):
+            os.remove(thumb_path)
+        try:
+            await msg_status.delete()
+        except:
+            pass
+
+@app.on_callback_query(filters.regex("cancelar_download"))
+async def cancelar_download_callback(client, callback_query):
+    """Cancela o download quando o botão é clicado"""
+    global DOWNLOAD_CANCELADO
+    DOWNLOAD_CANCELADO = True
+    await callback_query.answer("Download cancelado.")
+    try:
+        await callback_query.edit_message_text("❌ Download cancelado pelo usuário.")
+    except:
+        pass
+
+@app.on_callback_query(filters.regex("cancelar_upload"))
+async def cancelar_upload_callback(client, callback_query):
+    """Cancela o upload quando o botão é clicado"""
+    global UPLOAD_CANCELADO
+    UPLOAD_CANCELADO = True
+    await callback_query.answer("Upload cancelado.")
+    try:
+        await callback_query.edit_message_text("❌ Upload cancelado pelo usuário.")
+    except:
+        pass
 
 if __name__ == "__main__":
-    verificar_credenciais()
-    
-    # Prepara diretórios
     os.makedirs(Config.PASTA_DOWNLOAD, exist_ok=True)
     os.makedirs(Config.PASTA_THUMB, exist_ok=True)
 
-    # Limpeza inicial
-    for folder in [Config.PASTA_DOWNLOAD, Config.PASTA_THUMB]:
-        for file in os.listdir(folder):
-            if file.startswith(('dl_', 'thumb_')):
-                try:
-                    os.remove(os.path.join(folder, file))
-                except:
-                    pass
+    for file in os.listdir(Config.PASTA_DOWNLOAD):
+        if file.startswith('dl_'):
+            try:
+                os.remove(os.path.join(Config.PASTA_DOWNLOAD, file))
+            except:
+                pass
 
-    try:
-        asyncio.run(iniciar_bot())
-    except KeyboardInterrupt:
-        logger.info("⏹ Bot encerrado")
-    except Exception as e:
-        logger.error(f"❌ Erro fatal: {e}")
-    finally:
-        logger.info("🧹 Limpeza concluída")
+    for file in os.listdir(Config.PASTA_THUMB):
+        if file.startswith('thumb_'):
+            try:
+                os.remove(os.path.join(Config.PASTA_THUMB, file))
+            except:
+                pass
+
+    logger.info("----- Bot Iniciado -----")
+    app.run()
