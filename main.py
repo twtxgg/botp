@@ -2,6 +2,7 @@ import os
 import asyncio
 import yt_dlp
 import aiohttp
+import json
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup
 from pyrogram.errors import MessageNotModified, FloodWait
@@ -144,6 +145,109 @@ def extrair_metadados_video(caminho_arquivo):
     except Exception as e:
         logger.error(f"Erro ao extrair metadados: {str(e)}")
         return None
+
+def extrair_metadados_detalhados(video_path):
+    """Extrai metadados detalhados usando FFprobe"""
+    try:
+        cmd = [
+            'ffprobe', '-v', 'error',
+            '-show_entries', 'format=duration:stream=width,height,bit_rate',
+            '-of', 'json',
+            video_path
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        data = json.loads(result.stdout)
+        
+        duration = float(data['format']['duration'])
+        video_stream = next(s for s in data['streams'] if s['codec_type'] == 'video')
+        
+        return {
+            'duration': duration,
+            'width': int(video_stream['width']),
+            'height': int(video_stream['height']),
+            'bitrate': int(video_stream.get('bit_rate', 0)) // 1000 if video_stream.get('bit_rate') else None
+        }
+    except Exception as e:
+        logger.error(f"Erro ao extrair metadados detalhados: {str(e)}")
+        return None
+
+async def reduzir_video_adicional(input_path, current_size, duration, msg_status):
+    """Reduz ainda mais o vídeo se necessário"""
+    TAMANHO_ALVO = 1.90 * 1024 * 1024 * 1024
+    
+    # Calcular novo bitrate (reduzir 20%)
+    with open(input_path, 'rb') as f:
+        content = f.read()
+        bitrate_actual = (len(content) * 8) / (duration * 1000)  # kbps
+    
+    new_bitrate = int(bitrate_actual * 0.8)
+    new_maxrate = int(new_bitrate * 1.4)
+    new_bufsize = int(new_bitrate * 2)
+    
+    await msg_status.edit(f"⚠️ Ajustando bitrate para {new_bitrate}kbps...")
+    
+    output_path = input_path + ".reduced.mp4"
+    
+    cmd = [
+        'ffmpeg', '-y', '-i', input_path,
+        '-c:v', 'libx264',
+        '-b:v', f'{new_bitrate}k',
+        '-maxrate', f'{new_maxrate}k',
+        '-bufsize', f'{new_bufsize}k',
+        '-preset', 'fast',
+        '-profile:v', 'main',
+        '-pix_fmt', 'yuv420p',
+        '-movflags', '+faststart',
+        '-c:a', 'aac',
+        '-b:a', '64k',  # Reduzir áudio também
+        '-ac', '2',
+        output_path
+    ]
+    
+    process = await asyncio.create_subprocess_exec(*cmd)
+    await process.wait()
+    
+    if process.returncode == 0 and os.path.exists(output_path):
+        os.replace(output_path, input_path)
+    else:
+        raise Exception("Falha ao reduzir adicionalmente")
+
+async def enviar_video_convertido(client, mensagem, video_path, msg_status):
+    """Envia o vídeo convertido com os parâmetros adequados"""
+    metadados = extrair_metadados_detalhados(video_path)
+    if not metadados:
+        raise Exception("Não foi possível obter metadados do vídeo convertido")
+    
+    # Gerar thumbnail
+    thumb_path = os.path.join(Config.PASTA_THUMB, f"thumb_{os.path.basename(video_path)}.jpg")
+    if os.path.exists(thumb_path):
+        os.remove(thumb_path)
+    
+    subprocess.run([
+        'ffmpeg', '-y', '-ss', '00:00:05', '-i', video_path,
+        '-vframes', '1', '-q:v', '2', thumb_path
+    ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    
+    await msg_status.edit("⬆️ Enviando vídeo convertido...")
+    
+    params = {
+        'chat_id': mensagem.chat.id,
+        'video': video_path,
+        'duration': int(metadados['duration']),
+        'width': metadados['width'],
+        'height': metadados['height'],
+        'thumb': thumb_path if os.path.exists(thumb_path) else None,
+        'supports_streaming': True,
+        'progress': callback_progresso,
+        'progress_args': (msg_status,)
+    }
+    
+    if mensagem.reply_to_message:
+        params['reply_to_message_id'] = mensagem.reply_to_message.id
+    
+    await client.send_video(**params)
+    await msg_status.delete()
 
 def tratar_flood_wait(func):
     """Decorator para tratamento de FloodWait"""
@@ -371,7 +475,8 @@ async def comando_start(client, mensagem: Message):
         "• Envie uma URL de vídeo/imagem\n"
         "• Ou use /up <URL>\n"
         "• Para legenda direta: /leg <URL> <texto>\n"
-        "• Para adicionar legenda depois: responda com /leg <texto>\n\n"
+        "• Para adicionar legenda depois: responda com /leg <texto>\n"
+        "• Para converter vídeos grandes: /conv <URL> ou responda um vídeo com /conv\n\n"
         "💡 **Suporte a:** YouTube, XVideos e centenas de outros sites\n"
         "💡 **Em canais:** Responda a postagens com os comandos para enviar como comentário"
     )
@@ -525,7 +630,168 @@ async def comando_upload(client, mensagem: Message):
         if os.path.exists(thumb_path):
             os.remove(thumb_path)
 
-@app.on_message(filters.text & ~filters.command(["start", "help", "up", "leg"]))
+@app.on_message(filters.command("conv"))
+@tratar_flood_wait
+async def comando_converter_avancado(client, mensagem: Message):
+    """Handler avançado para o comando /conv com cálculo dinâmico de bitrate"""
+    global TEMPO_INICIO, DOWNLOAD_CANCELADO, UPLOAD_CANCELADO
+    
+    if len(mensagem.command) < 2 and not mensagem.reply_to_message:
+        await mensagem.reply("❌ Use /conv <URL> ou responda a um vídeo com /conv")
+        return
+
+    TEMPO_INICIO = time.time()
+    DOWNLOAD_CANCELADO = False
+    UPLOAD_CANCELADO = False
+    
+    msg_status = await mensagem.reply("🔍 Analisando vídeo...")
+    original_path = None
+    converted_path = None
+    
+    try:
+        # Obter o arquivo de origem (URL ou resposta)
+        if mensagem.reply_to_message:
+            if mensagem.reply_to_message.video:
+                file_id = mensagem.reply_to_message.video.file_id
+            elif mensagem.reply_to_message.document:
+                file_id = mensagem.reply_to_message.document.file_id
+            else:
+                await msg_status.edit("❌ Responda a um vídeo ou arquivo para converter")
+                return
+            
+            original_path = await client.download_media(
+                file_id,
+                file_name=os.path.join(Config.PASTA_DOWNLOAD, f"orig_{mensagem.id}.mp4"),
+                progress=progresso_download,
+                progress_args=(msg_status,)
+            )
+        else:
+            url = mensagem.text.split(maxsplit=1)[1]
+            original_path = os.path.join(Config.PASTA_DOWNLOAD, f"orig_{mensagem.id}.mp4")
+            sucesso = await baixar_com_ytdlp(url, original_path, msg_status) or \
+                     await download_arquivo_generico(url, original_path, msg_status)
+            if not sucesso:
+                raise Exception("Falha no download")
+
+        # Verificar tamanho original
+        tamanho_original = os.path.getsize(original_path)
+        if tamanho_original <= Config.TAMANHO_MAXIMO:
+            await msg_status.edit("ℹ️ O vídeo já está dentro do tamanho máximo. Enviando original...")
+            await enviar_video_convertido(client, mensagem, original_path, msg_status)
+            return
+
+        # Extrair metadados detalhados
+        metadados = extrair_metadados_detalhados(original_path)
+        if not metadados:
+            raise Exception("Falha ao extrair metadados")
+
+        duracao_segundos = metadados['duration']
+        if duracao_segundos <= 0:
+            raise Exception("Duração inválida do vídeo")
+
+        # Calcular bitrate de vídeo ideal para ~1.90GB
+        TAMANHO_ALVO = 1.90 * 1024 * 1024 * 1024  # ~1.90GB
+        BITRATE_AUDIO = 96  # kbps
+        BITRATE_AUDIO_BYTES = BITRATE_AUDIO * 1000 / 8  # bytes por segundo
+        
+        # Calcular espaço disponível para vídeo
+        espaco_audio = BITRATE_AUDIO_BYTES * duracao_segundos
+        espaco_video = TAMANHO_ALVO - espaco_audio
+        
+        if espaco_video <= 0:
+            raise Exception("Vídeo muito longo para o tamanho alvo")
+        
+        # Calcular bitrate de vídeo em kbps
+        bitrate_video_kbps = int((espaco_video * 8) / (1000 * duracao_segundos))
+        
+        # Ajustar bitrate máximo e buffer
+        maxrate = int(bitrate_video_kbps * 1.4)  # 40% acima do bitrate médio
+        bufsize = int(bitrate_video_kbps * 2)    # Tamanho do buffer
+        
+        # Limites de segurança
+        bitrate_video_kbps = max(500, min(bitrate_video_kbps, 8000))  # Entre 500kbps e 8000kbps
+        maxrate = max(700, min(maxrate, 10000))
+        bufsize = max(1000, min(bufsize, 16000))
+        
+        await msg_status.edit(f"🔄 Convertendo vídeo (bitrate: {bitrate_video_kbps}kbps)...")
+        
+        # Preparar caminhos
+        converted_path = os.path.join(Config.PASTA_DOWNLOAD, f"conv_{mensagem.id}.mp4")
+        
+        # Comando FFmpeg otimizado
+        cmd = [
+            'ffmpeg', '-y', '-i', original_path,
+            '-c:v', 'libx264', 
+            '-b:v', f'{bitrate_video_kbps}k',
+            '-maxrate', f'{maxrate}k',
+            '-bufsize', f'{bufsize}k',
+            '-preset', 'slow',
+            '-profile:v', 'main',
+            '-pix_fmt', 'yuv420p',
+            '-movflags', '+faststart',
+            '-c:a', 'aac',
+            '-b:a', f'{BITRATE_AUDIO}k',
+            '-ac', '2',
+            '-f', 'mp4',
+            converted_path
+        ]
+        
+        # Executar conversão
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        # Monitorar progresso
+        last_update = time.time()
+        while True:
+            await asyncio.sleep(2)
+            
+            if process.returncode is not None:
+                break
+                
+            if time.time() - last_update > Config.INTERVALO_ATUALIZACAO:
+                if os.path.exists(converted_path):
+                    current_size = os.path.getsize(converted_path)
+                    percent = (current_size / TAMANHO_ALVO) * 100
+                    await msg_status.edit(
+                        f"🔄 Convertendo vídeo...\n"
+                        f"🎞️ Bitrate: {bitrate_video_kbps}kbps\n"
+                        f"📊 Progresso: {percent:.1f}%\n"
+                        f"📦 Tamanho estimado: ~1.90GB"
+                    )
+                last_update = time.time()
+
+        # Verificar resultado
+        if process.returncode != 0 or not os.path.exists(converted_path):
+            stderr = await process.stderr.read()
+            raise Exception(f"Falha na conversão: {stderr.decode()[:200]}")
+        
+        # Verificar tamanho final
+        tamanho_final = os.path.getsize(converted_path)
+        if tamanho_final > Config.TAMANHO_MAXIMO:
+            # Se ainda for grande, tentar reduzir mais
+            await reduzir_video_adicional(converted_path, tamanho_final, duracao_segundos, msg_status)
+        
+        # Enviar vídeo convertido
+        await enviar_video_convertido(client, mensagem, converted_path, msg_status)
+
+    except Exception as e:
+        logger.error(f"Erro na conversão avançada: {str(e)}")
+        await msg_status.edit(f"❌ Erro: {str(e)[:200]}")
+        
+    finally:
+        # Limpeza
+        for path in [original_path, converted_path]:
+            if path and os.path.exists(path):
+                os.remove(path)
+        
+        thumb_path = os.path.join(Config.PASTA_THUMB, f"thumb_{os.path.basename(original_path)}.jpg")
+        if os.path.exists(thumb_path):
+            os.remove(thumb_path)
+
+@app.on_message(filters.text & ~filters.command(["start", "help", "up", "leg", "conv"]))
 @tratar_flood_wait
 async def lidar_com_links_automaticos(client, mensagem: Message):
     """Handler para links automáticos (sem comando)"""
